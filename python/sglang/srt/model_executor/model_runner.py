@@ -1847,6 +1847,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
+        elif self.server_args.kv_cache_dtype in ("turboquant3", "turboquant4"):
+            # TurboQuant: working dtype is bfloat16; compression is handled
+            # entirely inside MHATokenToKVPoolTurboQuant. Setting kv_cache_dtype
+            # to bfloat16 ensures all attention backends (FlashAttention, etc.)
+            # continue to work without modification — query tensors stay in bf16,
+            # and get_kv_buffer() returns decompressed bf16 KV data.
+            self.kv_cache_dtype = self.dtype
+            bits = 3 if self.server_args.kv_cache_dtype == "turboquant3" else 4
+            logger.warning(
+                f"TurboQuant {bits}-bit KV Cache is experimental. "
+                f"Expected ~{4.57 if bits == 3 else 3.56:.1f}x memory compression "
+                f"vs bfloat16 (head_dim=128). Accuracy may be slightly reduced."
+            )
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."

@@ -1216,6 +1216,178 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
+class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
+    """
+    KV cache pool with TurboQuant per-block quantization.
+
+    Stores K and V tensors in compressed form:
+      - Indices buffer: uint8, packed at 3 or 4 bits per value
+      - Scales buffer:  bfloat16, one scale per BLOCK_SIZE (32) values
+
+    Memory savings vs bfloat16 (head_dim=128):
+      turboquant3:  56 bytes/head  →  4.57x compression
+      turboquant4:  72 bytes/head  →  3.56x compression
+
+    Args:
+        bits: 3 or 4 (number of codebook bits)
+        All other args: same as MHATokenToKVPool
+    """
+
+    def __init__(self, bits: int, *args, **kwargs):
+        self._turboquant_bits = bits
+        super().__init__(*args, **kwargs)
+
+    def _create_buffers(self):
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            TURBOQUANT_BLOCK_SIZE,
+            packed_dim,
+            scale_dim,
+        )
+
+        bits = self._turboquant_bits
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                H = self.head_num
+                D = self.head_dim
+                # Values may have a different head dim (e.g. GQA with diff v_head_dim)
+                Dv = self.v_head_dim
+
+                assert D % TURBOQUANT_BLOCK_SIZE == 0, (
+                    f"head_dim={D} must be divisible by "
+                    f"TURBOQUANT_BLOCK_SIZE={TURBOQUANT_BLOCK_SIZE}"
+                )
+                assert Dv % TURBOQUANT_BLOCK_SIZE == 0, (
+                    f"v_head_dim={Dv} must be divisible by "
+                    f"TURBOQUANT_BLOCK_SIZE={TURBOQUANT_BLOCK_SIZE}"
+                )
+
+                self.store_dtype = torch.uint8
+
+                k_packed = packed_dim(bits, D)
+                v_packed = packed_dim(bits, Dv)
+                k_scales = scale_dim(D)
+                v_scales = scale_dim(Dv)
+
+                self.k_buffer = [
+                    torch.zeros((m, H, k_packed), dtype=torch.uint8, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros((m, H, v_packed), dtype=torch.uint8, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                self.k_scale_buffer = [
+                    torch.zeros(
+                        (m, H, k_scales), dtype=torch.bfloat16, device=self.device
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_scale_buffer = [
+                    torch.zeros(
+                        (m, H, v_scales), dtype=torch.bfloat16, device=self.device
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        del self.k_scale_buffer
+        del self.v_scale_buffer
+
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "k_buffer")
+        k_bytes = sum(
+            b.nbytes + s.nbytes for b, s in zip(self.k_buffer, self.k_scale_buffer)
+        )
+        v_bytes = sum(
+            b.nbytes + s.nbytes for b, s in zip(self.v_buffer, self.v_scale_buffer)
+        )
+        return k_bytes, v_bytes
+
+    def _get_turboquant(self, head_dim: int):
+        from sglang.srt.layers.quantization.kv_turboquant import KVTurboQuantUtil
+
+        return KVTurboQuantUtil.get_instance(
+            self._turboquant_bits, head_dim, self.device
+        )
+
+    def _get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        tq = self._get_turboquant(self.head_dim)
+        return tq.dequantize(
+            self.k_buffer[layer_id - self.start_layer],
+            self.k_scale_buffer[layer_id - self.start_layer],
+            dtype=self.dtype,
+        )
+
+    def _get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        tq = self._get_turboquant(self.v_head_dim)
+        return tq.dequantize(
+            self.v_buffer[layer_id - self.start_layer],
+            self.v_scale_buffer[layer_id - self.start_layer],
+            dtype=self.dtype,
+        )
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+
+        # If input is already quantized (e.g. fp8), dequantize first
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k = cache_k.to(self.dtype) * k_scale
+            else:
+                cache_k = cache_k.to(self.dtype)
+            if v_scale is not None:
+                cache_v = cache_v.to(self.dtype) * v_scale
+            else:
+                cache_v = cache_v.to(self.dtype)
+
+        tq_k = self._get_turboquant(self.head_dim)
+        tq_v = self._get_turboquant(self.v_head_dim)
+
+        packed_k, scales_k = tq_k.quantize(cache_k)
+        packed_v, scales_v = tq_v.quantize(cache_v)
+
+        self.k_buffer[layer_id - self.start_layer][loc] = packed_k
+        self.v_buffer[layer_id - self.start_layer][loc] = packed_v
+        self.k_scale_buffer[layer_id - self.start_layer][loc] = scales_k
+        self.v_scale_buffer[layer_id - self.start_layer][loc] = scales_v
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Must move both index buffers and scale buffers together.
+        for layer_idx in range(self.layer_num):
+            self.k_buffer[layer_idx][tgt_loc] = self.k_buffer[layer_idx][src_loc]
+            self.v_buffer[layer_idx][tgt_loc] = self.v_buffer[layer_idx][src_loc]
+            self.k_scale_buffer[layer_idx][tgt_loc] = self.k_scale_buffer[layer_idx][
+                src_loc
+            ]
+            self.v_scale_buffer[layer_idx][tgt_loc] = self.v_scale_buffer[layer_idx][
+                src_loc
+            ]
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "TurboQuant KV cache does not support disaggregation. "
+            "Use --kv-cache-dtype auto for disaggregated serving."
+        )
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 

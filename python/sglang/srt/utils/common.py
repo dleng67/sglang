@@ -201,6 +201,20 @@ def is_float4_e2m1fn_x2(dtype) -> bool:
     return is_cuda() and dtype == target_dtype
 
 
+def is_turboquant_kv_cache(kv_cache_dtype) -> bool:
+    """Check if kv_cache_dtype is a TurboQuant quantization string."""
+    return kv_cache_dtype in ("turboquant3", "turboquant4")
+
+
+def turboquant_bits(kv_cache_dtype: str) -> int:
+    """Return the number of bits for a TurboQuant kv_cache_dtype string."""
+    if kv_cache_dtype == "turboquant3":
+        return 3
+    elif kv_cache_dtype == "turboquant4":
+        return 4
+    raise ValueError(f"Not a TurboQuant dtype: {kv_cache_dtype}")
+
+
 def get_cuda_version():
     if torch.version.cuda:
         return tuple(map(int, torch.version.cuda.split(".")))
